@@ -63,6 +63,8 @@ compile_commands.json
 # Project binaries
 main
 src/main
+convolution_benchmark
+convolution_benchmark_cpu
 
 # Temporary files
 *.tmp 
