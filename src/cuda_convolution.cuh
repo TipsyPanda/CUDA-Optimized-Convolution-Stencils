@@ -54,7 +54,21 @@ void conv2d_cuda_v1(
     int width,
     int height,
     const float* d_kernel,
-    int kernel_size
+    int kernel_size,
+    int block_x = 16,
+    int block_y = 16
+);
+
+// V1_const: Global memory convolution with constant memory kernel
+void conv2d_cuda_v1_const(
+    const float* d_input,
+    float* d_output,
+    int width,
+    int height,
+    const float* d_kernel,
+    int kernel_size,
+    int block_x = 16,
+    int block_y = 16
 );
 
 // V2: Shared memory tiled convolution
@@ -64,7 +78,9 @@ void conv2d_cuda_v2(
     int width,
     int height,
     const float* d_kernel,
-    int kernel_size
+    int kernel_size,
+    int block_x = 16,
+    int block_y = 16
 );
 
 // Get device info

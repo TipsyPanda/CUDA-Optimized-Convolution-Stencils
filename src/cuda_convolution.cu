@@ -50,12 +50,70 @@ void conv2d_cuda_v1(
     int width,
     int height,
     const float* d_kernel,
-    int kernel_size
+    int kernel_size,
+    int block_x,
+    int block_y
 ) {
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
+    dim3 block(block_x, block_y);
+    dim3 grid((width + block_x - 1) / block_x, (height + block_y - 1) / block_y);
 
     conv2d_kernel_v1<<<grid, block>>>(d_input, d_output, width, height, d_kernel, kernel_size);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// ============================================================================
+// V1_const: Global Memory + Constant Memory Kernel
+// ============================================================================
+
+__global__ void conv2d_kernel_v1_const(
+    const float* __restrict__ input,
+    float* __restrict__ output,
+    int width,
+    int height,
+    int kernel_size
+) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (x >= width || y >= height) return;
+
+    const int half_k = kernel_size / 2;
+    float acc = 0.0f;
+
+    for (int ky = -half_k; ky <= half_k; ++ky) {
+        const int iy = y + ky;
+        if (iy < 0 || iy >= height) continue;
+
+        for (int kx = -half_k; kx <= half_k; ++kx) {
+            const int ix = x + kx;
+            if (ix < 0 || ix >= width) continue;
+
+            const int input_idx = iy * width + ix;
+            const int kernel_idx = (ky + half_k) * kernel_size + (kx + half_k);
+            acc += input[input_idx] * c_kernel[kernel_idx];
+        }
+    }
+
+    output[y * width + x] = acc;
+}
+
+void conv2d_cuda_v1_const(
+    const float* d_input,
+    float* d_output,
+    int width,
+    int height,
+    const float* d_kernel,
+    int kernel_size,
+    int block_x,
+    int block_y
+) {
+    // Copy kernel to constant memory
+    CUDA_CHECK(cudaMemcpyToSymbol(c_kernel, d_kernel, kernel_size * kernel_size * sizeof(float)));
+
+    dim3 block(block_x, block_y);
+    dim3 grid((width + block_x - 1) / block_x, (height + block_y - 1) / block_y);
+
+    conv2d_kernel_v1_const<<<grid, block>>>(d_input, d_output, width, height, kernel_size);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -68,51 +126,46 @@ __global__ void conv2d_kernel_v2_shared(
     const float* __restrict__ input,
     float* __restrict__ output,
     int width,
-    int height
+    int height,
+    int tile_w,
+    int tile_h,
+    int shared_w
 ) {
     constexpr int HALF_K = KERNEL_SIZE / 2;
-    constexpr int TILE_W = 16;
-    constexpr int TILE_H = 16;
-    constexpr int SHARED_W = TILE_W + 2 * HALF_K;
-    constexpr int SHARED_H = TILE_H + 2 * HALF_K;
+    extern __shared__ float tile[];
 
-    // Shared memory for tile + halo
-    __shared__ float tile[SHARED_H][SHARED_W];
+    const int out_x = blockIdx.x * tile_w + threadIdx.x;
+    const int out_y = blockIdx.y * tile_h + threadIdx.y;
 
-    // Output pixel coordinates
-    const int out_x = blockIdx.x * TILE_W + threadIdx.x;
-    const int out_y = blockIdx.y * TILE_H + threadIdx.y;
+    const int tile_start_x = blockIdx.x * tile_w - HALF_K;
+    const int tile_start_y = blockIdx.y * tile_h - HALF_K;
 
-    // Load tile + halo into shared memory
-    const int tile_start_x = blockIdx.x * TILE_W - HALF_K;
-    const int tile_start_y = blockIdx.y * TILE_H - HALF_K;
+    const int shared_h = tile_h + 2 * HALF_K;
 
     // Each thread may need to load multiple elements
-    const int num_loads_x = (SHARED_W + TILE_W - 1) / TILE_W;
-    const int num_loads_y = (SHARED_H + TILE_H - 1) / TILE_H;
+    const int num_loads_x = (shared_w + tile_w - 1) / tile_w;
+    const int num_loads_y = (shared_h + tile_h - 1) / tile_h;
 
     for (int ly = 0; ly < num_loads_y; ++ly) {
         for (int lx = 0; lx < num_loads_x; ++lx) {
-            const int shared_x = threadIdx.x + lx * TILE_W;
-            const int shared_y = threadIdx.y + ly * TILE_H;
+            const int sx = threadIdx.x + lx * tile_w;
+            const int sy = threadIdx.y + ly * tile_h;
 
-            if (shared_x < SHARED_W && shared_y < SHARED_H) {
-                const int global_x = tile_start_x + shared_x;
-                const int global_y = tile_start_y + shared_y;
+            if (sx < shared_w && sy < shared_h) {
+                const int gx = tile_start_x + sx;
+                const int gy = tile_start_y + sy;
 
                 float val = 0.0f;
-                if (global_x >= 0 && global_x < width &&
-                    global_y >= 0 && global_y < height) {
-                    val = input[global_y * width + global_x];
+                if (gx >= 0 && gx < width && gy >= 0 && gy < height) {
+                    val = input[gy * width + gx];
                 }
-                tile[shared_y][shared_x] = val;
+                tile[sy * shared_w + sx] = val;
             }
         }
     }
 
     __syncthreads();
 
-    // Compute convolution for this pixel
     if (out_x < width && out_y < height) {
         float acc = 0.0f;
 
@@ -120,9 +173,8 @@ __global__ void conv2d_kernel_v2_shared(
         for (int ky = 0; ky < KERNEL_SIZE; ++ky) {
             #pragma unroll
             for (int kx = 0; kx < KERNEL_SIZE; ++kx) {
-                const int sx = threadIdx.x + kx;
-                const int sy = threadIdx.y + ky;
-                acc += tile[sy][sx] * c_kernel[ky * KERNEL_SIZE + kx];
+                acc += tile[(threadIdx.y + ky) * shared_w + (threadIdx.x + kx)]
+                     * c_kernel[ky * KERNEL_SIZE + kx];
             }
         }
 
@@ -136,24 +188,29 @@ void conv2d_cuda_v2(
     int width,
     int height,
     const float* d_kernel,
-    int kernel_size
+    int kernel_size,
+    int block_x,
+    int block_y
 ) {
-    // Copy kernel to constant memory
     CUDA_CHECK(cudaMemcpyToSymbol(c_kernel, d_kernel, kernel_size * kernel_size * sizeof(float)));
 
-    dim3 block(16, 16);
-    dim3 grid((width + 15) / 16, (height + 15) / 16);
+    const int half_k = kernel_size / 2;
+    const int shared_w = block_x + 2 * half_k;
+    const int shared_h = block_y + 2 * half_k;
+    size_t smem_size = shared_w * shared_h * sizeof(float);
 
-    // Dispatch based on kernel size
+    dim3 block(block_x, block_y);
+    dim3 grid((width + block_x - 1) / block_x, (height + block_y - 1) / block_y);
+
     if (kernel_size == 3) {
-        conv2d_kernel_v2_shared<3><<<grid, block>>>(d_input, d_output, width, height);
+        conv2d_kernel_v2_shared<3><<<grid, block, smem_size>>>(d_input, d_output, width, height, block_x, block_y, shared_w);
     } else if (kernel_size == 5) {
-        conv2d_kernel_v2_shared<5><<<grid, block>>>(d_input, d_output, width, height);
+        conv2d_kernel_v2_shared<5><<<grid, block, smem_size>>>(d_input, d_output, width, height, block_x, block_y, shared_w);
     } else if (kernel_size == 7) {
-        conv2d_kernel_v2_shared<7><<<grid, block>>>(d_input, d_output, width, height);
+        conv2d_kernel_v2_shared<7><<<grid, block, smem_size>>>(d_input, d_output, width, height, block_x, block_y, shared_w);
     } else {
         fprintf(stderr, "V2: kernel size %d not supported, falling back to V1\n", kernel_size);
-        conv2d_cuda_v1(d_input, d_output, width, height, d_kernel, kernel_size);
+        conv2d_cuda_v1(d_input, d_output, width, height, d_kernel, kernel_size, block_x, block_y);
         return;
     }
 

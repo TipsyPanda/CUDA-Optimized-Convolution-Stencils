@@ -1,6 +1,6 @@
 # CUDA-Optimized Convolution Stencils
 
-GPU-accelerated 2D convolution with two kernel versions of increasing optimization, plus a multi-GPU framework.
+GPU-accelerated 2D convolution with multiple kernel versions of increasing optimization and configurable block sizes.
 
 ## Prerequisites
 
@@ -13,7 +13,7 @@ GPU-accelerated 2D convolution with two kernel versions of increasing optimizati
 ```bash
 # Full build (requires CUDA)
 make CUDA_ARCH=61      # GTX 1050 Ti (Pascal)
-make CUDA_ARCH=75      # RTX 2080 (Turing)
+make CUDA_ARCH=75      # T4 / RTX 2080 (Turing)
 make CUDA_ARCH=86      # RTX 3080 (Ampere)
 make CUDA_ARCH=89      # RTX 4090 (Ada)
 
@@ -39,9 +39,36 @@ Implements 2D image convolution (zero-padded) in four ways:
 | Version | Description | Where |
 |---------|-------------|-------|
 | **CPU** | Sequential baseline, arbitrary kernel sizes (3x3, 5x5, 7x7) | `cpu_convolution.cpp` |
-| **GPU V1** | Naive - one thread per pixel, global memory reads | `cuda_convolution.cu` |
-| **GPU V2** | Tiled - shared memory with halo handling, constant memory kernel | `cuda_convolution.cu` |
-| **Multi-GPU** | Splits image by rows with halo overlap, stitches on CPU | `cuda_convolution.cu` |
+| **GPU V1** | Naive — one thread per pixel, kernel weights from global memory | `cuda_convolution.cu` |
+| **GPU V1_const** | Same as V1, but kernel weights from `__constant__` memory | `cuda_convolution.cu` |
+| **GPU V2** | Tiled — shared memory for input tile + halo, constant memory kernel | `cuda_convolution.cu` |
+
+All GPU kernels accept configurable block dimensions (8x8, 16x16, 32x8, 32x16, 32x32).
+
+## Parallelization Strategy
+
+### What is parallelized
+
+2D convolution computes each output pixel independently: it multiplies a small filter kernel against the pixel's neighborhood and sums the results. Since every output pixel is independent, this maps naturally to GPU threads — one thread per pixel, with the 2D image tiled into 2D thread blocks.
+
+### Why GPU convolution is fast
+
+1. **Massive parallelism.** A 2048x2048 image has ~4M pixels. The GPU launches 4M threads that execute concurrently across all SMs, while the CPU processes pixels sequentially (or with limited SIMD).
+
+2. **Memory coalescing.** Adjacent threads in a warp read adjacent pixels in memory, enabling coalesced 128-byte transactions instead of scattered loads.
+
+3. **Constant memory caching (V1_const).** The filter kernel is small (e.g. 25 floats for 5x5) and read-only. Placing it in `__constant__` memory means all threads in a warp broadcast-read the same weight from a dedicated cache, eliminating redundant global memory traffic.
+
+4. **Shared memory tiling (V2).** Each thread block loads its input tile (plus a halo for border pixels) into fast on-chip shared memory. Neighbor reads during convolution then hit shared memory (~100x lower latency than global memory) instead of going off-chip. The benefit grows with larger kernels because each pixel touches more neighbors.
+
+### Optimization progression
+
+```
+V1 (global)  →  V1_const (+ constant mem kernel)  →  V2 (+ shared mem tiling)
+    ↓                    ↓                                   ↓
+All reads from      Kernel weights cached           Input tile in shared mem,
+global DRAM         in constant cache               kernel in constant cache
+```
 
 ## Supported Filters
 
@@ -49,52 +76,58 @@ Gaussian blur (3x3, 5x5, 7x7), Sobel X/Y, Laplacian, box blur, sharpen, emboss, 
 
 Defined in `filters.cpp`.
 
-## Results (NVIDIA GeForce GTX 1050 Ti, 6 SMs, 112 GB/s bandwidth)
+## Benchmarks
+
+Results below are from an **NVIDIA GeForce GTX 1050 Ti** (6 SMs, 112 GB/s peak bandwidth). Run the benchmark on your own GPU to get updated numbers.
 
 ### Correctness
 
-All GPU kernels produce bit-identical output to the CPU baseline (error = 0.00):
+All GPU kernels produce bit-identical output to the CPU baseline (max error = 0.00):
 
-| Filter | V1 | V2 |
-|--------|----|----|
-| Gaussian 3x3, 5x5, 7x7 | PASS | PASS |
-| Sobel X 3x3 | PASS | PASS |
-| Laplacian 3x3 | PASS | PASS |
-| Box blur 3x3, 5x5 | PASS | PASS |
-| Multi-GPU | PASS (0.00 error vs single GPU) | |
+| Filter | V1 | V1_const | V2 |
+|--------|----|----|-----|
+| Gaussian 3x3, 5x5, 7x7 | PASS | PASS | PASS |
+| Sobel X 3x3 | PASS | PASS | PASS |
+| Laplacian 3x3 | PASS | PASS | PASS |
+| Box blur 3x3, 5x5 | PASS | PASS | PASS |
 
 ### Image Size Sweep (Gaussian 3x3)
 
-| Size | CPU (ms) | V1 (ms) | V2 (ms) | Speedup V1 | Speedup V2 |
-|------|----------|---------|---------|------------|------------|
-| 256x256 | 1.58 | 0.017 | 0.019 | 90x | 83x |
-| 512x512 | 6.33 | 0.073 | 0.064 | 87x | 100x |
-| 1024x1024 | 25.31 | 0.287 | 0.228 | 88x | 111x |
-| 2048x2048 | 100.59 | 1.132 | 0.884 | 89x | 114x |
-| 4096x4096 | 403.54 | 4.500 | 3.520 | 90x | 115x |
+| Size | CPU (ms) | V1 (ms) | V1c (ms) | V2 (ms) | Speedup V1 | Speedup V2 |
+|------|----------|---------|----------|---------|------------|------------|
+| 256x256 | 1.00 | 0.017 | 0.020 | 0.030 | 59x | 34x |
+| 512x512 | 3.99 | 0.073 | 0.072 | 0.103 | 54x | 39x |
+| 1024x1024 | 16.11 | 0.287 | 0.270 | 0.385 | 56x | 42x |
+| 2048x2048 | 65.99 | 1.132 | 1.047 | 1.519 | 58x | 43x |
+| 4096x4096 | 265.23 | 4.500 | 4.176 | 5.819 | 59x | 46x |
 
-V2 speedup grows with image size because larger images keep the GPU busier (better occupancy).
+V2 speedup over CPU grows with image size because larger images keep the GPU busier (better occupancy). For small kernels like 3x3, V2's shared memory overhead exceeds the benefit — V1_const is faster. V2 shines with larger kernels (see below).
 
 ### Kernel Size Sweep (1024x1024 image)
 
-| Kernel | CPU (ms) | V1 (ms) | V2 (ms) | V2/V1 |
-|--------|----------|---------|---------|-------|
-| 3x3 | 25.23 | 0.276 | 0.216 | 1.28x |
-| 5x5 | 57.43 | 0.605 | 0.300 | 2.02x |
-| 7x7 | 104.61 | 0.967 | 0.436 | 2.22x |
+| Kernel | CPU (ms) | V1 (ms) | V1c (ms) | V2 (ms) | V2/V1 |
+|--------|----------|---------|----------|---------|-------|
+| 3x3 | 16.29 | 0.274 | 0.260 | 0.356 | 0.77x |
+| 5x5 | 35.73 | 0.600 | 0.556 | 0.402 | 1.49x |
+| 7x7 | 67.68 | 0.968 | 0.862 | 0.510 | 1.90x |
 
-Larger kernels benefit more from shared memory tiling because each pixel reads more neighbors, increasing data reuse per tile.
+For 3x3, the shared memory tiling overhead outweighs the benefit (only 9 neighbor reads per pixel). Starting at 5x5, V2 pulls ahead, and at 7x7 it's nearly 2x faster than V1. V1_const consistently outperforms V1 by 5-12%, showing that even just caching kernel weights in constant memory helps.
 
-### Block Size Sweep (1024x1024, Gaussian 5x5)
+### Block Size Sweep (2048x2048, Gaussian 5x5)
 
-| Block | V1 (ms) | V2 (ms) | V2/V1 |
-|-------|---------|---------|-------|
-| 8x8 | 0.652 | 0.296 | 2.20x |
-| 16x16 | 0.601 | 0.305 | 1.97x |
-| 32x8 | 0.606 | 0.235 | **2.57x** |
-| 32x16 | 0.621 | 0.257 | 2.42x |
+| Block | Threads | V1 (ms) | V1c (ms) | V2 (ms) | V2/V1 |
+|-------|---------|---------|----------|---------|-------|
+| 8x8 | 64 | 2.555 | 2.292 | 1.558 | 1.64x |
+| 16x16 | 256 | 2.407 | 2.215 | 1.588 | 1.52x |
+| 32x8 | 256 | 2.305 | 2.047 | 1.418 | 1.63x |
+| 32x16 | 512 | 2.265 | 2.063 | 1.870 | 1.21x |
+| 32x32 | 1024 | 2.303 | 2.100 | 2.043 | 1.13x |
 
-32x8 is optimal because the 32-wide rows match the warp size, giving perfectly coalesced memory access.
+Key observations:
+- **32x8 is the fastest V2 config** — 32 threads wide means every warp accesses contiguous memory (perfect coalescing), and the small tile height keeps shared memory usage low, allowing more concurrent blocks per SM.
+- **8x8 blocks (64 threads):** Only 2 warps per block — not enough to hide memory latency, resulting in the worst V1 performance.
+- **32x32 blocks (1024 threads):** Maximum threads per block, but the large shared memory tile ((32+4)x(32+4) = 1296 floats for 5x5) limits concurrent blocks per SM, making V2 barely faster than V1.
+- **V1 is less sensitive to block shape** because it has no shared memory — the main factor is occupancy and coalescing.
 
 ## Project Structure
 
@@ -102,7 +135,7 @@ Larger kernels benefit more from shared memory tiling because each pixel reads m
 src/
 ├── main.cpp               # Benchmark harness and correctness tests
 ├── cpu_convolution.cpp/h  # CPU convolution (arbitrary kernel sizes)
-├── cuda_convolution.cu    # GPU kernels V1, V2 + multi-GPU
+├── cuda_convolution.cu    # GPU kernels V1, V1_const, V2
 ├── cuda_convolution.cuh   # CUDA interfaces, error checking, timer
 ├── filters.cpp/h          # Filter kernel definitions
 └── image_utils.h          # Synthetic image generators (noise, checkerboard, gradients)
